@@ -46,10 +46,10 @@ var defaultConfig = {
       "rickymarti2013@gmail.com"
     ],
     "@infomovil.com.bo": [
-      "hclazarte@gmail.com"
+      "hector@geosoft.com.bo"
     ],
     "@geosoft.website": [
-      "geosoft.internacional@gmail.com"
+      "hector@geosoft.com.bo"
     ]
   }
 };
