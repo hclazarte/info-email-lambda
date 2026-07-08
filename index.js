@@ -90,6 +90,23 @@ function normalizeEmail(email) {
   return (email || '').trim().toLowerCase()
 }
 
+function extractHeaderValue(emailData, headerName) {
+  const regex = new RegExp(
+    '^' + headerName + ':[\\t ]?(.*(?:\\r?\\n\\s+.*)*)',
+    'im'
+  )
+  const match = emailData.match(regex)
+
+  if (!match || !match[1]) return ''
+
+  return match[1].replace(/\r?\n\s+/g, ' ').trim()
+}
+
+function extractEmail(value) {
+  const match = value.match(/<([^>]+)>/)
+  return normalizeEmail(match ? match[1] : value)
+}
+
 /**
  * Parses the SES event record provided for the `mail` and `receipients` data.
  *
@@ -207,62 +224,75 @@ exports.checkBlacklist = function (data) {
     return Promise.resolve(data)
   }
 
-  const sender = normalizeEmail(data.email.source)
+  const candidates = []
 
-  if (!sender) {
-    data.log({
-      level: 'warn',
-      message:
-        'No se pudo determinar data.email.source. Se omite validación de blacklist.'
-    })
-    return Promise.resolve(data)
+  const source = normalizeEmail(data.email.source)
+  if (source) candidates.push({ type: 'source', email: source })
+
+  if (data.emailData) {
+    const replyTo = extractEmail(extractHeaderValue(data.emailData, 'Reply-To'))
+    if (replyTo) candidates.push({ type: 'reply-to', email: replyTo })
   }
 
   data.log({
     level: 'info',
-    message: 'Consultando blacklist para remitente: ' + sender
+    message:
+      'Consultando blacklist para: ' +
+      candidates.map((c) => c.type + '=' + c.email).join(', ')
   })
 
   return new Promise(function (resolve, reject) {
-    dynamodb.get(
-      {
-        TableName: tableName,
-        Key: {
-          email: sender
-        }
-      },
-      function (err, result) {
-        if (err) {
-          data.log({
-            level: 'error',
-            message: 'Error consultando DynamoDB blacklist.',
-            error: err,
-            stack: err.stack
-          })
-          return reject(new Error('Error: No se pudo consultar la blacklist.'))
-        }
-
-        if (result.Item && result.Item.enabled === true) {
-          data.log({
-            level: 'warn',
-            message: 'Correo bloqueado por blacklist.',
-            sender: sender,
-            reason: result.Item.reason || null,
-            messageId: data.email.messageId
-          })
-
-          return data.callback()
-        }
-
+    function checkNext(index) {
+      if (index >= candidates.length) {
         data.log({
           level: 'info',
-          message: 'Remitente no bloqueado. Continúa el procesamiento.',
-          sender: sender
+          message:
+            'Ninguna dirección está bloqueada. Continúa el procesamiento.'
         })
-
         return resolve(data)
       }
-    )
+
+      const candidate = candidates[index]
+
+      dynamodb.get(
+        {
+          TableName: tableName,
+          Key: {
+            email: candidate.email
+          }
+        },
+        function (err, result) {
+          if (err) {
+            data.log({
+              level: 'error',
+              message: 'Error consultando DynamoDB blacklist.',
+              error: err,
+              stack: err.stack
+            })
+            return reject(
+              new Error('Error: No se pudo consultar la blacklist.')
+            )
+          }
+
+          if (result.Item && result.Item.enabled === true) {
+            data.log({
+              level: 'warn',
+              message: 'Correo bloqueado por blacklist.',
+              blockedBy: candidate.type,
+              email: candidate.email,
+              reason: result.Item.reason || null,
+              messageId: data.email.messageId
+            })
+
+            return data.callback()
+          }
+
+          return checkNext(index + 1)
+        }
+      )
+    }
+
+    checkNext(0)
   })
 }
 
@@ -496,8 +526,8 @@ exports.handler = function (event, context, callback, overrides) {
       : [
           exports.parseEvent,
           exports.transformRecipients,
-          exports.checkBlacklist,
           exports.fetchMessage,
+          exports.checkBlacklist,
           exports.processMessage,
           exports.sendMessage
         ]
