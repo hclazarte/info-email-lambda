@@ -69,8 +69,10 @@ console.log('AWS Lambda SES Forwarder // @arithmetric // Version 5.1.0')
 //
 // - Todas las comparaciones de correos se realizan en minúsculas.
 // - El sistema depende de S3 para obtener el contenido del correo.
-// - La blacklist se consulta en DynamoDB usando el email del remitente.
-// - Si el remitente está bloqueado (enabled = true), el correo no se procesa.
+// - La blacklist se consulta en DynamoDB de forma conservadora:
+//   remitente (source/From) o Reply-To externo distinto al From (spoofing).
+// - Los avisos de rebote (NDR) nunca se bloquean; deben reenviarse siempre.
+// - Si una dirección está bloqueada (enabled = true), el correo no se procesa.
 // - El sistema no elimina correos, solo controla su reenvío.
 
 var defaultConfig = {
@@ -90,12 +92,21 @@ function normalizeEmail(email) {
   return (email || '').trim().toLowerCase()
 }
 
-function extractHeaderValue(emailData, headerName) {
+function getHeaderSection(emailData) {
+  if (!emailData) return ''
+
+  const match = emailData.match(/\r?\n\r?\n/)
+  return match ? emailData.slice(0, match.index) : emailData
+}
+
+function extractHeaderValue(headerSection, headerName) {
+  if (!headerSection) return ''
+
   const regex = new RegExp(
     '^' + headerName + ':[\\t ]?(.*(?:\\r?\\n\\s+.*)*)',
     'im'
   )
-  const match = emailData.match(regex)
+  const match = headerSection.match(regex)
 
   if (!match || !match[1]) return ''
 
@@ -105,6 +116,91 @@ function extractHeaderValue(emailData, headerName) {
 function extractEmail(value) {
   const match = value.match(/<([^>]+)>/)
   return normalizeEmail(match ? match[1] : value)
+}
+
+var SYSTEM_MAIL_LOCALPARTS =
+  /^(mailer-daemon|postmaster|noreply|no-reply|bounce|bounces|mail-delivery-subsystem)$/i
+
+var BOUNCE_SUBJECT_PATTERNS = [
+  /delivery status notification/i,
+  /undelivered mail/i,
+  /undeliverable/i,
+  /mail delivery failed/i,
+  /failure notice/i,
+  /returned mail/i,
+  /delivery failure/i,
+  /no se pudo entregar/i,
+  /no se ha podido entregar/i
+]
+
+function isSystemMailAddress(email) {
+  if (!email || !email.includes('@')) return true
+
+  return SYSTEM_MAIL_LOCALPARTS.test(email.split('@')[0])
+}
+
+function isBounceNotification(data) {
+  var source = normalizeEmail(data.email && data.email.source)
+  if (source && isSystemMailAddress(source)) return true
+
+  var commonHeaders = (data.email && data.email.commonHeaders) || {}
+  var subject = commonHeaders.subject || ''
+
+  if (
+    BOUNCE_SUBJECT_PATTERNS.some(function (pattern) {
+      return pattern.test(subject)
+    })
+  ) {
+    return true
+  }
+
+  if (!data.emailData) return false
+
+  var headerSection = getHeaderSection(data.emailData)
+  var headerSubject = extractHeaderValue(headerSection, 'Subject')
+
+  if (
+    BOUNCE_SUBJECT_PATTERNS.some(function (pattern) {
+      return pattern.test(headerSubject)
+    })
+  ) {
+    return true
+  }
+
+  var contentType = extractHeaderValue(headerSection, 'Content-Type')
+  return /multipart\/report/i.test(contentType)
+}
+
+/**
+ * Construye candidatos conservadores para consultar en la blacklist.
+ * Solo incluye direcciones con alta confianza de ser el remitente real.
+ */
+function buildBlacklistCandidates(data) {
+  var candidates = []
+  var headerSection = data.emailData ? getHeaderSection(data.emailData) : ''
+  var from = extractEmail(extractHeaderValue(headerSection, 'From'))
+  var source = normalizeEmail(data.email.source)
+  var sender = source || from
+
+  if (sender && !isSystemMailAddress(sender)) {
+    candidates.push({
+      type: source ? 'source' : 'from',
+      email: sender
+    })
+  }
+
+  var replyTo = extractEmail(extractHeaderValue(headerSection, 'Reply-To'))
+  if (
+    replyTo &&
+    !isSystemMailAddress(replyTo) &&
+    replyTo !== from &&
+    replyTo !== source &&
+    replyTo !== sender
+  ) {
+    candidates.push({ type: 'reply-to', email: replyTo })
+  }
+
+  return candidates
 }
 
 /**
@@ -224,14 +320,24 @@ exports.checkBlacklist = function (data) {
     return Promise.resolve(data)
   }
 
-  const candidates = []
+  if (isBounceNotification(data)) {
+    data.log({
+      level: 'info',
+      message:
+        'Aviso de rebote detectado. Se omite validación de blacklist para permitir el reenvío.'
+    })
+    return Promise.resolve(data)
+  }
 
-  const source = normalizeEmail(data.email.source)
-  if (source) candidates.push({ type: 'source', email: source })
+  const candidates = buildBlacklistCandidates(data)
 
-  if (data.emailData) {
-    const replyTo = extractEmail(extractHeaderValue(data.emailData, 'Reply-To'))
-    if (replyTo) candidates.push({ type: 'reply-to', email: replyTo })
+  if (!candidates.length) {
+    data.log({
+      level: 'info',
+      message:
+        'Sin remitente aplicable para blacklist. Continúa el procesamiento.'
+    })
+    return Promise.resolve(data)
   }
 
   data.log({
